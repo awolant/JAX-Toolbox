@@ -29,6 +29,8 @@ from jax.experimental import multihost_utils
 from rosetta.data import wds_utils
 from t5x import partitioning, utils
 
+from rosetta.data.dali_iterator import get_dali_iterator
+
 
 PyTree = Any
 
@@ -233,11 +235,29 @@ class DALIIterator:
     }
 
 
+# def get_dali_dataset(cfg,
+#                      ds_shard_id,
+#                      num_ds_shards,
+#                      feature_converter_cls,
+#                      pipeline = None,
+#                      ):
+
+#   assert not bool(feature_converter_cls), 'Passing `feature_converter_cls` is not supported'
+
+#   seed = cfg.seed
+#   if seed is None:
+#     # Use a shared timestamp across devices as the seed.
+#     seed = int(multihost_utils.broadcast_one_to_all(np.int32(time.time())))
+#   cfg.seed = seed
+  
+
+#   return iter(DALIIterator(pipeline(cfg, ds_shard_id, num_ds_shards)))
+
+
 def get_dali_dataset(cfg,
                      ds_shard_id,
                      num_ds_shards,
                      feature_converter_cls,
-                     pipeline = None,
                      ):
 
   assert not bool(feature_converter_cls), 'Passing `feature_converter_cls` is not supported'
@@ -247,8 +267,9 @@ def get_dali_dataset(cfg,
     # Use a shared timestamp across devices as the seed.
     seed = int(multihost_utils.broadcast_one_to_all(np.int32(time.time())))
   cfg.seed = seed
+  
+  return get_dali_iterator(cfg, ds_shard_id, num_ds_shards, seed)
 
-  return iter(DALIIterator(pipeline(cfg, ds_shard_id, num_ds_shards)))
 
 def get_dali_eval_dataset(cfg,
                      ds_shard_id,
