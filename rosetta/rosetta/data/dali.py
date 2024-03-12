@@ -292,14 +292,18 @@ class ShardedDatasetIterator:
   def is_nonpadding(self):
     """ Returns a boolean array indicating which examples in the batch
        are not padding examples. """
-    bs = self._global_shapes[next(iter(self._global_shapes))][0]
+       
+    if hasattr(self._iterator, 'is_nonpadding'):
+     padding_info = self._iterator.is_nonpadding
+    else:       
+      bs = self._global_shapes[next(iter(self._global_shapes))][0]
 
-    source_info = self._iterator.source_info
-    source_shift_right = [self._iterator.last_source] + source_info[:-1]
-    is_nonpadding = (1-(np.array(source_info)==np.array(source_shift_right))).astype(bool)
+      source_info = self._iterator.source_info
+      source_shift_right = [self._iterator.last_source] + source_info[:-1]
+      padding_info = (1-(np.array(source_info)==np.array(source_shift_right))).astype(bool)
 
     return utils._create_sharded_array(
-        self._partitioner, {'source': (bs,)}, {'source': np.array(is_nonpadding)},
+        self._partitioner, {'source': (bs,)}, {'source': np.array(padding_info)},
     )['source']
 
   @property

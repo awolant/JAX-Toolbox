@@ -32,7 +32,7 @@ setuptools.setup(
         'pillow',
         'webdataset',
         'matplotlib',
-        'nvidia-dali-cuda120',
+        'nvidia-dali-nightly-cuda120',
     ],
 
     extras_require={
