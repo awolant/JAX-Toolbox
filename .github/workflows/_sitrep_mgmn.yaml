@@ -27,16 +27,17 @@ jobs:
       STATUS: ${{ steps.gen-sitrep.outputs.STATUS }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download all artifacts from the previous jobs
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
 
       - name: Write exit status summary
         id: exit-status
         shell: bash -x -e {0}
         run: |
-          EXIT_STATUSES="${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-*/*-status.json"
+          # Glob after inputs.FW_NAME to capture things like rosetta-t5x-vit
+          EXIT_STATUSES="${{ inputs.FW_NAME }}*-${GITHUB_RUN_ID}-*/*-status.json"
           EXIT_STATUS_SUMMARY_FILE="exit_status_summary.json"
           echo -e "\n\n## ${{ inputs.FW_NAME }} MGMN+SPMD Test Status" >> $EXIT_STATUS_SUMMARY_FILE
           cat <<EOF >>$EXIT_STATUS_SUMMARY_FILE
@@ -46,12 +47,13 @@ jobs:
 
           for i in $EXIT_STATUSES; do
             # Files are named <FW_NAME>-<GHID>-<NAME>/<NAME>-status.json
-            echo "| $(echo $i | cut -d/ -f1 | awk -F- '{print $NF}') | $(jq -r .state $i) | $(jq -r .exitcode $i)"
+            echo "| $(basename $i -status.json) | $(jq -r .state $i) | $(jq -r .exitcode $i)"
           done | tee -a $EXIT_STATUS_SUMMARY_FILE
 
           echo "Test statuses:"
           jq -rc 'input_filename,.' $EXIT_STATUSES
 
+          cat $EXIT_STATUS_SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
           echo "EXIT_STATUS_SUMMARY_FILE=$EXIT_STATUS_SUMMARY_FILE" >> ${GITHUB_OUTPUT}
 
       - name: Write metrics summary
@@ -59,14 +61,27 @@ jobs:
         shell: bash -x -e {0}
         run: |
           METRICS_SUMMARY_FILE="metrics_summary.json"
-          echo -e "\n\n## ${{ inputs.FW_NAME }} MGMN Test Metrics" >> $METRICS_SUMMARY_FILE
-          for i in metrics-test-log/*_metrics.json; do
-            echo $i | cut -d'.' -f1
-            echo '```json'
-            jq . $i
-            echo '```'
-          done | tee -a $METRICS_SUMMARY_FILE
 
+          echo '## ${{ inputs.FW_NAME }} MGMN Test Metrics' | tee -a $METRICS_SUMMARY_FILE
+          python <<EOF | tee -a $METRICS_SUMMARY_FILE
+          import json
+          files = "$(echo ${{ inputs.FW_NAME }}-metrics-test-log/*_metrics.json)".split()
+          header = None
+          print_row = lambda lst: print('| ' + ' | '.join(str(el) for el in lst) + ' |')
+          for path in files:
+            with open(path) as f:
+              obj = json.loads(f.read())
+              if not header:
+                header = list(obj.keys())
+                print_row(["Job Name"] + header)
+                print_row(["---"] * (1+len(header)))
+              job_name = path[:-len('_metrics.json')]
+              print_row([job_name] + [obj[h] for h in header])
+          print('NOTE: Average step time includes compilation time and thus may be an underestimate of true performance')
+
+          EOF
+
+          cat $METRICS_SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
           echo "METRICS_SUMMARY_FILE=$METRICS_SUMMARY_FILE" >> ${GITHUB_OUTPUT}
 
       - name: Generate sitrep
@@ -75,13 +90,14 @@ jobs:
         run: |
           source .github/workflows/scripts/to_json.sh
 
-          EXIT_STATUSES="${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-*/*-status.json"
+          # Glob after inputs.FW_NAME to capture things like rosetta-t5x-vit
+          EXIT_STATUSES="${{ inputs.FW_NAME }}*-${GITHUB_RUN_ID}-*/*-status.json"
 
           passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
           failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
           total_tests=$(ls $EXIT_STATUSES | wc -l)
 
-          METRICS_LOG=metrics-test-log/report.jsonl
+          METRICS_LOG=${{ inputs.FW_NAME }}-metrics-test-log/report.jsonl
           all_outcomes() {
             cat $METRICS_LOG | jq -r '. | select((.["$report_type"] == "TestReport") and (.when == "call")) | .outcome'
           }
@@ -105,15 +121,16 @@ jobs:
           fi
           badge_message="${passed_tests}/${total_tests} jobs | ${pytest_passed_tests}/${pytest_total_tests} metrics"
 
-          badge_label='Upstream Tests'
+          badge_label='${{ inputs.FW_NAME }} Tests'
           summary="# ${{ inputs.FW_NAME }} MGMN Test: $badge_message"
-          summary+=`cat ${{ steps.exit-status.outputs.EXIT_STATUS_SUMMARY_FILE }}`
-          summary+=`cat ${{ steps.metrics.outputs.METRICS_SUMMARY_FILE }}`
+          full_result_markdown=$(cat ${{ steps.exit-status.outputs.EXIT_STATUS_SUMMARY_FILE }})
+          full_result_markdown+=$(cat ${{ steps.metrics.outputs.METRICS_SUMMARY_FILE }})
 
           to_json \
             summary \
             total_tests passed_tests failed_tests \
             badge_label badge_color badge_message \
+            full_result_markdown \
           > sitrep.json
 
           schemaVersion=1 \
@@ -126,7 +143,7 @@ jobs:
           echo "STATUS=${status}" >> ${GITHUB_OUTPUT}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.ARTIFACT_NAME }}
           path: |

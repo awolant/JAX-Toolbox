@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1-labs
 
-ARG BASE_IMAGE=ghcr.io/nvidia/jax:mealkit
+ARG BASE_IMAGE=ghcr.io/nvidia/jax-mealkit:jax
 ARG SRC_PATH_MAXTEXT=/opt/maxtext
 
 ###############################################################################
@@ -18,11 +18,10 @@ cat "${SRC_PATH_MAXTEXT}/requirements.txt" >> /opt/pip-tools.d/requirements-maxt
 EOF
 
 ###############################################################################
-## Apply patch
+## Add test script to the path
 ###############################################################################
 
-ADD maxtext-mha.patch /opt
-RUN cd "${SRC_PATH_MAXTEXT}" && patch -p1 < /opt/maxtext-mha.patch && git diff
+ADD test-maxtext.sh /usr/local/bin
 
 ###############################################################################
 ## Install accumulated packages from the base image and the previous stage

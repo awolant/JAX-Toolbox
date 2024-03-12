@@ -34,7 +34,7 @@ docker run -ti --gpus=all --net=host --ipc=host -v <DATASET_PATH>:/opt/paxml/dat
 where `DATASET_PATH` is the path to the Pile or Lambada dataset. If these datasets have not yet been downloaded, they can be downloaded from inside of the container (see [Downloading The Pile and Lambada Datasets](#Downloading-the-pile-and-lambada-datasets) for more). `WORKSPACE_PATH` is the path to the directory where you would like to store any persistent files, and `VOCAB_PATH` is the path to the pretrained SentencePiece model to use during tokenization (see [Downloading the SentencePiece Model](#Downloading-the-sentencepiece-model) for more). 
 
 ## Downloading The Pile and Lambada Datasets
-__IMPORTANT UPDATE__: Please be aware that as of October 2023, 'the_pile' dataset is no longer accessible. The team is actively updating our instructions and configurations to incorporate a more recent large language model (LLM) dataset. Additionally, we will shortly provide updated instructions that include methods for using synthetic data, ensuring that our users can continue their work without interruption.
+__IMPORTANT UPDATE__: Please be aware that as of October 2023, 'the_pile' dataset is no longer accessible. The team is actively updating our instructions and configurations to incorporate a more recent large language model (LLM) dataset. Additionally, we have provided updated instructions that include methods for using synthetic data, ensuring that our users can continue their work without interruption. Please see the [synthetic dataset](#Synthetic-dataset) section below for more information.
 
 The GPT model configs we provide are trained using The Pile dataset and evaluated using the Lambada dataset. The scripts [download_the_pile.py](https://github.com/google/paxml/blob/main/paxml/contrib/gpu/scripts_gpu/download_the_pile.py) and [download_lambada.py](https://github.com/google/paxml/blob/main/paxml/contrib/gpu/scripts_gpu/download_lambada.py) will download The Pile and Lambada datasets to the `TFDS_DATA_DIR` enviroment variable. To control the location of the downloaded datasets, use the following command prior to running the download scripts: `export TFDS_DATA_DIR=<path_to_dowload_data_to>`. For example, the following commands download the Pile dataset to `/opt/paxml/datasets/`:
 ```
@@ -126,6 +126,9 @@ Note that packing is currently not supported when using TE. All configs disable 
 ### Native FP8
 Rosetta Pax containers also provide support for native FP8 through XLA. Enabling FP8 can be done by adding the following command-line flag to `paxml/contrib/gpu/scripts_gpu/run_pile_singlenode.sh`: `--fdl.USE_FP8=True`. When using native FP8, TE must be disabled. For a detailed explanation of native FP8 support in Pax, as well as a comparison between native FP8 and TE FP8, please refer to the [NATIVE_FP8](https://github.com/NVIDIA/JAX-Toolbox/blob/main/rosetta/docs/NATIVE_FP8.md) documentation.
 
+### Flash Attention
+As of 2/6/2024, CuDNN flash attention was enabled by default via XLA. Divergence has been observed with the GPT 126M model with flash attention enabled. If you observe divergence when running GPT 126M, you can disable flash attention using the following XLA flag: `--set_xla_gpu_enable_cudnn_fmha=False`.
+
 ## XLA Flags
 We recommend setting the following XLA flags when running experiments: 
 
@@ -154,7 +157,8 @@ BASE_XLA_FLAGS="--xla_gpu_enable_latency_hiding_scheduler=true --xla_gpu_enable_
 ```
 
 ## Configs
-We provide three "base" model configurations in `paxml/contrib/gpu/scripts_gpu/configs.py`. The first is a 126 million parameter GPT model. Convergence using The Pile dataset has been verified with this model. The remaining configs are 5 billion and 175 billion parameter models. Both 5B and 175B are provided primarily for benchmarking purposes and been less thoroughly tested for convergence.
+### GPT
+We provide three "base" GPT model configurations in `paxml/contrib/gpu/scripts_gpu/configs.py`. The first is a 126 million parameter GPT model. Convergence using The Pile dataset has been verified with this model. The remaining configs are 5 billion and 175 billion parameter models. Both 5B and 175B are provided primarily for benchmarking purposes and been less thoroughly tested for convergence.
 
 The tables below describe current performance of the given configs. Experiments were run using NVIDIA DGX A100 80G and H100 80G nodes. Note that Lambada accuracy reported corresponds to the best accuracy seen across the run. Estimated walltime denotes the aproximate time to train each model to completion (i.e. number of days to reach `MAX_STEPS` number of steps as described in `configs.py`).
 
@@ -184,6 +188,30 @@ The tables below describe current performance of the given configs. Experiments 
 
 5B FP8 was trained for 75,000 steps at a global batch size of 2048 and a sequence length of 2048, amounting to around 300 billion consumed tokens. 175B FP8 was trained for a total of around 1,000 steps at a global batch size of 1536 and a sequence length of 2048, amounting to around 3.14 billion consumed tokens. 175B was trained using the [C4 dataset](https://github.com/mlcommons/training/tree/master/large_language_model/paxml#2-dataset) and restores from an [initial MLPerf checkpoint](https://github.com/mlcommons/training/tree/master/large_language_model/paxml#initial-checkpoint). 126M and 5B were both trained using the Pile.
 
+### LLaMA
+We also provide LLaMA-2 7B, 13B and 70B configs. These configs are variants of the [LLaMA configs](https://github.com/google/saxml/blob/main/saxml/server/pax/lm/params/lm_cloud.py) provided by Saxml and have been validated on the [BoolQ](https://github.com/google-research-datasets/boolean-questions) dataset. The table below reports BoolQ accuracy for each model.
+
+| Size | Precision | #GPUs | DP | FSDP | TP | BS / GPU | BoolQ Accuracy |
+| ---- |---------- | ----- | -- | ---- | -- | -------- | -------------- |
+| 7B   | BF16      | 8     | 1  | 8    | 1  | 16       | 77.52%         |
+| 13B  | BF16      | 8     | 1  | 8    | 1  | 8        | 82.99%         |
+| 70B  | BF16      | 16    | 1  | 16   | 1  | 4        | 85.08%         |
+
+Saxml provides a [script](https://github.com/google/saxml/blob/f3efdafed400d03be22efdb39a006f1420460d9f/saxml/tools/convert_llama_ckpt.py) to convert Meta's LLaMA checkpoints to Paxml format. This script can be run inside of any JAX-Toolbox pax container. First, apply for access and download the Meta checkpoints and LLaMA tokenizer using [this link](https://llama.meta.com/llama-downloads/). Then, mount the Meta checkpoints to the container and run the following commands to convert the checkpoint:
+```
+pip install pytorch ## loading meta checkpoints requires pytorch
+wget https://raw.githubusercontent.com/google/saxml/f3efdafed400d03be22efdb39a006f1420460d9f/saxml/tools/convert_llama_ckpt.py
+python3 -m convert_llama_ckpt --base-model-path <meta checkpoint path> --pax-model-path <path to save checkpoint to> --model-size <7b, 13b, or 70b>
+```
+
+The script [download_boolq.py](https://github.com/google/paxml/blob/main/paxml/contrib/gpu/scripts_gpu/download_boolq.py) downloads the BoolQ dataset to the `TFDS_DATA_DIR` (see [Downloading the Pile and Lambada Datasets](#Downloading-the-pile-and-lambada-datasets) for more). Once BoolQ has been downloaded, the script [example_slurm_llama.sub](https://github.com/NVIDIA/JAX-Toolbox/blob/main/rosetta/rosetta/projects/pax/scripts/example_slurm_llama.sub) can be used to reproduce the results reported in the table. Launch the script using the following command:
+```
+CONTAINER=<CONTAINER> BASE_WORKSPACE_DIR=<PATH_TO_WORKSPACE> BASE_TFDS_DATA_DIR=<PATH_TO_BOOLQ> BASE_VOCAB_PATH=<PATH_TO_LLAMA_TOKENIZER> BASE_CHECKPOINT_DIR=<PATH_TO_CONVERTED_CHECKPOINT> OUTPUT_DIR=<OUTPUT_DIR_LOCAL> PREC=bfloat16 GPUS_PER_NODE=8 PERCORE_BATCH_SIZE=<BSIZE_PER_GPU> CONFIG=<LLaMA_CONFIG> sbatch -N <NUM_NODES> -A <ACCOUNT> -p <PARTITION> -J <JOBNAME> scripts/example_slurm_llama.sub
+```
+`CONFIG` should be one of `LLaMA7B`, `LLaMA13B`, or `LLaMA70B` and `PERCORE_BATCH_SIZE` and `NUM_NODES` should match with the table above.
+
+_Note_: The given LLaMA configs currently do not have support for Transformer Engine. We are actively working on this and will update the configs as TE support becomes available.
+
 ### Running an Experiment with Base Configs
 To run an experiment with any base model configuration with the default parallel strategy reported in the table, copy [run_pile_multinode.sh](https://github.com/google/paxml/blob/main/paxml/contrib/gpu/scripts_gpu/run_pile_multinode.sh) to your workspace and make the following modifications: replace `--fdl_config=paxml.contrib.gpu.scripts_gpu.configs.Pile126M` with the experiment you are interested in running (e.g. `paxml.contrib.gpu.scripts_gpu.configs.GPT5B` or `paxml.contrib.gpu.scripts_gpu.configs.GPT175B`) and remove `--fdl.ICI_MESH_SHAPE="[${NUM_GPUS}, 1, 1]"` and `--fdl.DCN_MESH_SHAPE="[${SLURM_JOB_NUM_NODES}, 1, 1]"`. The resulting bash script (call it `run_my_model_multinode.sh`) can be passed into `example_slurm_pile.sub` using the following command. This command presumes that `run_my_model_multinode.sh` lives in `BASE_WORKSPACE_DIR`.
 ```
@@ -194,6 +222,18 @@ Here, it is assumed that you are running with the number of nodes reported in th
 --fdl.DCN_MESH_SHAPE=[1,16,1]
 ```
 
+#### Synthetic Dataset
+We also provide 126M, 5B and 175B configurations with a dummy dataset for quick benchmarking. The script `paxml/contrib/gpu/scripts_gpu/benchmark_gpt_multinode.sh` benchmarks any of the given base models using the synthetic dataset. [scripts/example_slurm_synthetic.sub](https://github.com/NVIDIA/JAX-Toolbox/tree/main/rosetta/rosetta/projects/pax/scripts/example_slurm_synthetic.sub) can be used to launch this script on a slurm cluster. This script can be launched using the following command:
+
+```
+BASE_WORKSPACE_DIR=<PATH_TO_WORKSPACE> CONFIG=Synthetic<126M, 5B, 175B> OUTPUT_DIR=<OUTPUT_DIR> PREC=bfloat16 ENABLE_TE=<ENABLE_TE> ENABLE_FP8=<ENABLE_FP8> GPUS_PER_NODE=8 PERCORE_BATCH_SIZE=<BATCH_SIZE_PER_GPU> LOG_DIR_LOCAL=<LOG_DIR> sbatch -N <NODES> -A <ACCOUNT> -p <PARTITION> -J <JOBNAME> scripts/example_slurm_synthetic.sub
+```
+
+For example, the following command benchmarks the 5B model on 32 nodes with TE BF16 using the synthetic dataset:
+```
+BASE_WORKSPACE_DIR=<PATH_TO_WORKSPACE> CONFIG=Synthetic5B OUTPUT_DIR=output_synthetic_5b PREC=bfloat16 ENABLE_TE=1 ENABLE_FP8=0 GPUS_PER_NODE=8 PERCORE_BATCH_SIZE=8 LOG_DIR_LOCAL=log_dir_synthetic_5b sbatch -N 32 -A <ACCOUNT> -p <PARTITION> -J <JOBNAME> scripts/example_slurm_synthetic.sub
+```
+Note that with models that are particularly dataloading-bottlenecked (e.g. smaller models, such as 126M), the throughput observed using the synthetic dataset may be higher than the throughput observed when training on a real dataset.
 
 ## Known Issues
 * Pipeline parallelism is not supported with NVIDIA Transformer Engine enabled in the Paxml container.

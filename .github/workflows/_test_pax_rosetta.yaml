@@ -8,20 +8,25 @@ on:
         description: PAX image from ghcr.io/nvidia/pax
         default: ghcr.io/nvidia/pax:latest
         required: false
-      EXTRA_TEST_ARGS:
+      BADGE_FILENAME:
         type: string
-        description: Extra command line args to pass to test-pax.sh
-        default: ""
+        description: 'Name of the endpoint JSON file for shields.io badge'
         required: false
+        default: 'badge-rosetta-pax-mgmn-test.json'
       ARTIFACT_NAME:
+          type: string
+          description: 'Name of the artifact zip file'
+          required: false
+          default: 'artifact-rosetta-pax-mgmn-test'
+      FW_NAME:
         type: string
-        description: If provided, will prepend a prefix to the artifact name. Helpful if re-running this reusable workflow to prevent clobbering of artifacts
-        default: ""
+        description: 'Name of the framework being used'
         required: false
+        default: 'rosetta-pax'
     outputs:
       TEST_STATUS:
         description: 'Summary pass/fail value indicating if results from tests are acceptable'
-        value: ${{ jobs.publish-test.outputs.STATUS }}
+        value: ${{ jobs.sitrep.outputs.STATUS }}
 
 jobs:
 
@@ -35,14 +40,20 @@ jobs:
 
     runs-on: ubuntu-22.04
 
+    env:
+      BADGE_FILENAME_PREFIX: badge-rosetta-pax-single-process-multi-device-te
+
     steps:
       - name: Print environment variables
         run: env
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.8.0
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Check out the repository under ${GITHUB_WORKSPACE}
+        uses: actions/checkout@v4
 
       - name: Setup SSH known hosts
         id: ssh-known-hosts
@@ -53,28 +64,31 @@ jobs:
           EOF
           chmod 600 ~/.ssh/known_hosts
           echo "FILE=$(realpath ~/.ssh/known_hosts)" >> $GITHUB_OUTPUT
+
       - name: Labels and metadata
         id: meta
         shell: bash -x -e {0}
         run: |
           IMAGE="$(echo ${{inputs.PAX_IMAGE}} | sed 's/\//#/')"
           TEST_CASE_NAME=${{ matrix.PARALLEL_CONFIG[1] }}DP${{ matrix.PARALLEL_CONFIG[2] }}FSDP${{ matrix.PARALLEL_CONFIG[3] }}TP${{ matrix.PARALLEL_CONFIG[0] }}PP_single_process_TE
-          TOTAL_TASKS=1
           MAX_GPUS_PER_NODE=8
-          NODES=1
           GPUS_PER_NODE=8
-          JOB_NAME=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
+          NODES=1
+          TOTAL_TASKS=1
+          JOB_NAME=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
           LOG_FILE=/nfs/cluster/${JOB_NAME}.log
           MODEL_PATH=/nfs/cluster/${JOB_NAME}
           for var in IMAGE TEST_CASE_NAME TOTAL_TASKS NODES GPUS_PER_NODE JOB_NAME LOG_FILE MODEL_PATH; do
             echo "$var=${!var}" >> $GITHUB_OUTPUT
           done
+
       - name: Submit SLURM jobs over SSH
         id: submit
         shell: bash -O expand_aliases -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           alias sshx='ssh -o "ServerAliveInterval 7" ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}'
-          sshx "date && hostname && sinfo" 
+          sshx "date && hostname && sinfo"
           sshx mkdir -p ${{ steps.meta.outputs.MODEL_PATH }}
           JOB=$(sshx sbatch --parsable << EOF
           #!/bin/bash
@@ -82,12 +96,21 @@ jobs:
           #SBATCH --exclusive
           #SBATCH --nodes=${{ steps.meta.outputs.NODES }}
           #SBATCH --gpus-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
-          #SBATCH --tasks=${{ steps.meta.outputs.TOTAL_TASKS }}
           #SBATCH --time=00:30:00
           #SBATCH --output=${{ steps.meta.outputs.LOG_FILE }}
           #SBATCH --export="VOCAB_PATH=gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model,ENROOT_PASSWORD=${{ secrets.GITHUB_TOKEN }}"
+
+          # preload enroot container using one task per node
           time srun \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-image=${{ steps.meta.outputs.IMAGE }} \
+            true
+
+          # run job with tasks on each node sharing one container
+          time srun \
+            --ntasks=${{ steps.meta.outputs.TOTAL_TASKS }} \
+            --container-name=runtime \
             --container-mounts=${{ steps.meta.outputs.MODEL_PATH }}:/output \
             --container-entrypoint \
             test-pax.sh \
@@ -100,19 +123,16 @@ jobs:
               --fsdp ${{ matrix.PARALLEL_CONFIG[2] }} \
               --tensor-parallel ${{ matrix.PARALLEL_CONFIG[3] }} \
               --nodes ${{ steps.meta.outputs.NODES }} \
-              --enable-te \
-              ${{ inputs.EXTRA_TEST_ARGS }}
+              --enable-te
           EOF
           )
 
           echo "SLURM_JOB_ID=${JOB}" >> $GITHUB_OUTPUT
 
-          set +x
-          while sshx squeue -j $JOB | grep -q $JOB; do
-            echo "SLURM Job $JOB is still running."
-            sleep 15
-          done
-          echo "SLURM Job $JOB finished."
+          . .github/workflows/scripts/wait_for_slurm_job.sh
+
+          wait_for_slurm_job ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }} ${JOB}
+
           # Gather job info
           SLURM_STATE=$(sshx sacct -j $JOB --format=State --parsable2 --noheader |& head -n 1)
           SLURM_EXITCODE=$(sshx sacct -j $JOB --format=exitcode --parsable2 --noheader | sort -r -u | head -1 | cut -f 1 -d":" | sed 's/ //g')
@@ -132,6 +152,7 @@ jobs:
       - name: Retrieve training logs and upload to TensorBoard server
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           mkdir output/
           rsync -rtz --progress \
             ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}:${{ steps.meta.outputs.LOG_FILE }} \
@@ -141,7 +162,7 @@ jobs:
             output/ || true
           rsync -rtz --progress \
             output/ \
-            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.ARTIFACT_NAME }}rosetta-pax-/ || true
+            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}/ || true
 
       - name: Write SLURM job status to file
         shell: bash -x -e {0}
@@ -152,9 +173,50 @@ jobs:
               dump = {'state': "${{ steps.submit.outputs.SLURM_STATE }}", 'exitcode': "${{ steps.submit.outputs.SLURM_EXITCODE }}"}
               json.dump(dump, f)
           EOF
+
+      - name: Generate sitrep
+        if: success() || failure()
+        shell: bash -x -e {0}
+        run: |
+          # bring in utility functions
+          cd $GITHUB_WORKSPACE
+          source .github/workflows/scripts/to_json.sh
+
+          EXIT_STATUSES="output/*-status.json"
+          badge_label='ROSETTA PAX SINGLE PROCESS MULTI DEVICE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}'
+          passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
+          failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
+          total_tests=$(ls $EXIT_STATUSES | wc -l)
+          
+          if [[ ${failed_tests} > 0 ]] || [[ ${total_tests} == 0 ]]; then
+            badge_message='error'
+            badge_color=red
+            summary="ROSETTA PAX SINGLE PROCESS MULTI DEVICE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          else
+            badge_message="${passed_tests}/${total_tests} passed"
+            if [[ ${failed_tests} == 0 ]]; then
+              badge_color=brightgreen
+            else
+              badge_color=yellow
+            fi
+            summary="ROSETTA PAX SINGLE PROCESS MULTI DEVICE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          fi
+          
+          to_json \
+            summary \
+            total_tests passed_tests failed_tests \
+            badge_label badge_color badge_message \
+          > output/sitrep.json
+
+          schemaVersion=1 \
+          label="${badge_label}" \
+          message="${badge_message}" \
+          color="${badge_color}" \
+          to_json schemaVersion label message color \
+          > output/${{ env.BADGE_FILENAME_PREFIX }}-${{ steps.meta.outputs.TEST_CASE_NAME }}.json
         
       - name: Upload training logs as artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.JOB_NAME }}
           path: output/*
@@ -162,24 +224,51 @@ jobs:
   rosetta-pax-multi-node-te:
     strategy:
       matrix:
-        PARALLEL_CONFIG:
-        - [1, 1, 1, 1]
-        - [1, 8, 1, 1]
-        - [1, 1, 8, 1]
-        - [1, 4, 1, 2]
-        - [1, 16, 1, 1]
+        include:
+          - TEST_NAME: 1DP1FSDP1TP1PP_TE
+            PARALLEL_CONFIG: [1, 1, 1, 1]
+            BATCH_SIZE: 4
+            ADDITIONAL_ARGS: ""
+          - TEST_NAME: 8DP1FSDP1TP1PP_TE
+            PARALLEL_CONFIG: [1, 8, 1, 1]
+            ADDITIONAL_ARGS: ""
+            BATCH_SIZE: 4
+          - TEST_NAME: 1DP8FSDP1TP1PP_TE
+            PARALLEL_CONFIG: [1, 1, 8, 1]
+            BATCH_SIZE: 4
+            ADDITIONAL_ARGS: ""
+          - TEST_NAME: 4DP1FSDP2TP1PP_TE
+            PARALLEL_CONFIG: [1, 4, 1, 2]
+            BATCH_SIZE: 4
+            ADDITIONAL_ARGS: ""
+          - TEST_NAME: 16DP1FSDP1TP1PP_TE
+            PARALLEL_CONFIG: [1, 16, 1, 1]
+            BATCH_SIZE: 4
+            ADDITIONAL_ARGS: ""
+          - TEST_NAME: 5B_fused_attn_1
+            PARALLEL_CONFIG: [1, 1, 8, 1]
+            BATCH_SIZE: 2
+            ADDITIONAL_ARGS: "--run-5b --enable-fused-attn"
+          - TEST_NAME: 5B_fused_attn_0
+            PARALLEL_CONFIG: [1, 1, 8, 1]
+            BATCH_SIZE: 2
+            ADDITIONAL_ARGS: "--run-5b"
       fail-fast: false
 
     runs-on: ubuntu-22.04
-
+    env:
+      BADGE_FILENAME_PREFIX: badge-rosetta-pax-multi-node-te
     steps:
       - name: Print environment variables
         run: env
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.8.0
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Check out the repository under ${GITHUB_WORKSPACE}
+        uses: actions/checkout@v4
 
       - name: Setup SSH known hosts
         id: ssh-known-hosts
@@ -195,14 +284,15 @@ jobs:
         id: meta
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           IMAGE="$(echo ${{inputs.PAX_IMAGE}} | sed 's/\//#/')"
-          TEST_CASE_NAME=${{ matrix.PARALLEL_CONFIG[1] }}DP${{ matrix.PARALLEL_CONFIG[2] }}FSDP${{ matrix.PARALLEL_CONFIG[3] }}TP${{ matrix.PARALLEL_CONFIG[0] }}PP_TE
+          TEST_CASE_NAME=${{ matrix.TEST_NAME }}
           TOTAL_TASKS=$((${{ matrix.PARALLEL_CONFIG[0] }} * ${{ matrix.PARALLEL_CONFIG[1] }} * ${{ matrix.PARALLEL_CONFIG[2] }} * ${{ matrix.PARALLEL_CONFIG[3] }}))
           MAX_GPUS_PER_NODE=8
           NODES=$(((TOTAL_TASKS+MAX_GPUS_PER_NODE-1)/MAX_GPUS_PER_NODE))
           GPUS_PER_NODE=$((TOTAL_TASKS/NODES))
 
-          JOB_NAME=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
+          JOB_NAME=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
           LOG_FILE=/nfs/cluster/${JOB_NAME}.log
           MODEL_PATH=/nfs/cluster/${JOB_NAME}
           for var in IMAGE TEST_CASE_NAME TOTAL_TASKS NODES GPUS_PER_NODE JOB_NAME LOG_FILE MODEL_PATH; do
@@ -214,7 +304,7 @@ jobs:
         shell: bash -O expand_aliases -x -e {0}
         run: |
           alias sshx='ssh -o "ServerAliveInterval 7" ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}'
-          sshx "date && hostname && sinfo" 
+          sshx "date && hostname && sinfo"
           sshx mkdir -p ${{ steps.meta.outputs.MODEL_PATH }}
           JOB=$(sshx sbatch --parsable << EOF
           #!/bin/bash
@@ -222,19 +312,28 @@ jobs:
           #SBATCH --exclusive
           #SBATCH --nodes=${{ steps.meta.outputs.NODES }}
           #SBATCH --gpus-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
-          #SBATCH --tasks=${{ steps.meta.outputs.TOTAL_TASKS }}
-          #SBATCH --tasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
           #SBATCH --time=00:30:00
           #SBATCH --output=${{ steps.meta.outputs.LOG_FILE }}
           #SBATCH --export="VOCAB_PATH=gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model,ENROOT_PASSWORD=${{ secrets.GITHUB_TOKEN }}"
+
+          # preload enroot container using one task per node
           time srun \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-image=${{ steps.meta.outputs.IMAGE }} \
+            true
+
+          # run job with tasks on each node sharing one container
+          time srun \
+            --ntasks=${{ steps.meta.outputs.TOTAL_TASKS }} \
+            --ntasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }} \
+            --container-name=runtime \
             --container-mounts=${{ steps.meta.outputs.MODEL_PATH }}:/output \
             --container-entrypoint \
             test-pax.sh \
               --output /output/${{ steps.meta.outputs.TEST_CASE_NAME }} \
               --dtype bfloat16 \
-              --batch-per-gpu 4 \
+              --batch-per-gpu ${{ matrix.BATCH_SIZE }} \
               --steps 300 \
               --pipeline-parallel ${{ matrix.PARALLEL_CONFIG[0] }} \
               --data-parallel ${{ matrix.PARALLEL_CONFIG[1] }} \
@@ -242,21 +341,17 @@ jobs:
               --tensor-parallel ${{ matrix.PARALLEL_CONFIG[3] }} \
               --nodes ${{ steps.meta.outputs.NODES }} \
               --enable-te \
-              --additional-args --fdl.PACKED_INPUT=False \
-              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess) \
-              ${{ inputs.EXTRA_TEST_ARGS }}
+              --additional-args "--fdl.PACKED_INPUT=False"  \
+              ${{ matrix.ADDITIONAL_ARGS }} \
+              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess)
           EOF
           )
 
           echo "SLURM_JOB_ID=${JOB}" >> $GITHUB_OUTPUT
 
-          set +x
-          while sshx squeue -j $JOB | grep -q $JOB; do
-            echo "SLURM Job $JOB is still running."
-            sleep 15
-          done
+          . .github/workflows/scripts/wait_for_slurm_job.sh
 
-          echo "SLURM Job $JOB finished."
+          wait_for_slurm_job ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }} ${JOB}
 
           # Gather job info
           SLURM_STATE=$(sshx sacct -j $JOB --format=State --parsable2 --noheader |& head -n 1)
@@ -278,6 +373,7 @@ jobs:
       - name: Retrieve training logs and upload to TensorBoard server
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           mkdir output/
           rsync -rtz --progress \
             ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}:${{ steps.meta.outputs.LOG_FILE }} \
@@ -287,7 +383,7 @@ jobs:
             output/ || true
           rsync -rtz --progress \
             output/ \
-            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}/ || true
+            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}/ || true
 
       - name: Write SLURM job status to file
         shell: bash -x -e {0}
@@ -298,9 +394,50 @@ jobs:
               dump = {'state': "${{ steps.submit.outputs.SLURM_STATE }}", 'exitcode': "${{ steps.submit.outputs.SLURM_EXITCODE }}"}
               json.dump(dump, f)
           EOF
+
+      - name: Generate sitrep
+        if: success() || failure()
+        shell: bash -x -e {0}
+        run: |
+          # bring in utility functions
+          cd $GITHUB_WORKSPACE
+          source .github/workflows/scripts/to_json.sh
+
+          EXIT_STATUSES="output/*-status.json"
+          badge_label='ROSETTA PAX MULTI NODE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}'
+          passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
+          failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
+          total_tests=$(ls $EXIT_STATUSES | wc -l)
+          
+          if [[ ${failed_tests} > 0 ]] || [[ ${total_tests} == 0 ]]; then
+            badge_message='error'
+            badge_color=red
+            summary="ROSETTA PAX MULTI NODE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          else
+            badge_message="${passed_tests}/${total_tests} passed"
+            if [[ ${failed_tests} == 0 ]]; then
+              badge_color=brightgreen
+            else
+              badge_color=yellow
+            fi
+            summary="ROSETTA PAX MULTI NODE TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          fi
+
+          to_json \
+            summary \
+            total_tests passed_tests failed_tests \
+            badge_label badge_color badge_message \
+          > output/sitrep.json
+      
+          schemaVersion=1 \
+          label="${badge_label}" \
+          message="${badge_message}" \
+          color="${badge_color}" \
+          to_json schemaVersion label message color \
+          > output/${{ env.BADGE_FILENAME_PREFIX }}-${{ steps.meta.outputs.TEST_CASE_NAME }}.json
         
       - name: Upload training logs as artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.JOB_NAME }}
           path: output/*
@@ -316,15 +453,19 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-22.04
-
+    env:
+      BADGE_FILENAME_PREFIX: badge-rosetta-pax-multi-node
     steps:
       - name: Print environment variables
         run: env
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.8.0
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Check out the repository under ${GITHUB_WORKSPACE}
+        uses: actions/checkout@v4
 
       - name: Setup SSH known hosts
         id: ssh-known-hosts
@@ -347,7 +488,7 @@ jobs:
           NODES=$(((TOTAL_TASKS+MAX_GPUS_PER_NODE-1)/MAX_GPUS_PER_NODE))
           GPUS_PER_NODE=$((TOTAL_TASKS/NODES))
 
-          JOB_NAME=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
+          JOB_NAME=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
           LOG_FILE=/nfs/cluster/${JOB_NAME}.log
           MODEL_PATH=/nfs/cluster/${JOB_NAME}
           for var in IMAGE TEST_CASE_NAME TOTAL_TASKS NODES GPUS_PER_NODE JOB_NAME LOG_FILE MODEL_PATH; do
@@ -358,6 +499,7 @@ jobs:
         id: submit
         shell: bash -O expand_aliases -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           alias sshx='ssh -o "ServerAliveInterval 7" ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}'
           sshx "date && hostname && sinfo"
           sshx mkdir -p ${{ steps.meta.outputs.MODEL_PATH }}
@@ -367,13 +509,22 @@ jobs:
           #SBATCH --exclusive
           #SBATCH --nodes=${{ steps.meta.outputs.NODES }}
           #SBATCH --gpus-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
-          #SBATCH --tasks=${{ steps.meta.outputs.TOTAL_TASKS }}
-          #SBATCH --tasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
           #SBATCH --time=00:30:00
           #SBATCH --output=${{ steps.meta.outputs.LOG_FILE }}
           #SBATCH --export="VOCAB_PATH=gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model,ENROOT_PASSWORD=${{ secrets.GITHUB_TOKEN }}"
+
+          # preload enroot container using one task per node
           time srun \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-image=${{ steps.meta.outputs.IMAGE }} \
+            true
+
+          # run job with tasks on each node sharing one container
+          time srun \
+            --ntasks=${{ steps.meta.outputs.TOTAL_TASKS }} \
+            --ntasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }} \
+            --container-name=runtime \
             --container-mounts=${{ steps.meta.outputs.MODEL_PATH }}:/output \
             --container-entrypoint \
             test-pax.sh \
@@ -386,20 +537,15 @@ jobs:
               --fsdp ${{ matrix.PARALLEL_CONFIG[2] }} \
               --tensor-parallel ${{ matrix.PARALLEL_CONFIG[3] }} \
               --nodes ${{ steps.meta.outputs.NODES }} \
-              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess) \
-              ${{ inputs.EXTRA_TEST_ARGS }}
+              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess)
           EOF
           )
 
           echo "SLURM_JOB_ID=${JOB}" >> $GITHUB_OUTPUT
 
-          set +x
-          while sshx squeue -j $JOB | grep -q $JOB; do
-            echo "SLURM Job $JOB is still running."
-            sleep 15
-          done
+          . .github/workflows/scripts/wait_for_slurm_job.sh
 
-          echo "SLURM Job $JOB finished."
+          wait_for_slurm_job ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }} ${JOB}
 
           # Gather job info
           SLURM_STATE=$(sshx sacct -j $JOB --format=State --parsable2 --noheader |& head -n 1)
@@ -421,6 +567,7 @@ jobs:
       - name: Retrieve training logs and upload to TensorBoard server
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           mkdir output/
           rsync -rtz --progress \
             ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}:${{ steps.meta.outputs.LOG_FILE }} \
@@ -430,7 +577,7 @@ jobs:
             output/ || true
           rsync -rtz --progress \
             output/ \
-            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}/ || true
+            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}/ || true
 
       - name: Write SLURM job status to file
         shell: bash -x -e {0}
@@ -442,8 +589,49 @@ jobs:
               json.dump(dump, f)
           EOF
 
+      - name: Generate sitrep
+        if: success() || failure()
+        shell: bash -x -e {0}
+        run: |
+          # bring in utility functions
+          cd $GITHUB_WORKSPACE
+          source .github/workflows/scripts/to_json.sh
+
+          EXIT_STATUSES="output/*-status.json"
+          badge_label='ROSETTA PAX MULTI NODE ${{ steps.meta.outputs.TEST_CASE_NAME }}'
+          passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
+          failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
+          total_tests=$(ls $EXIT_STATUSES | wc -l)
+          
+          if [[ ${failed_tests} > 0 ]] || [[ ${total_tests} == 0 ]]; then
+            badge_message='error'
+            badge_color=red
+            summary="ROSETTA PAX MULTI NODE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          else
+            badge_message="${passed_tests}/${total_tests} passed"
+            if [[ ${failed_tests} == 0 ]]; then
+              badge_color=brightgreen
+            else
+              badge_color=yellow
+            fi
+            summary="ROSETTA PAX MULTI NODE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          fi
+
+          to_json \
+            summary \
+            total_tests passed_tests failed_tests \
+            badge_label badge_color badge_message \
+          > output/sitrep.json
+          
+          schemaVersion=1 \
+          label="${badge_label}" \
+          message="${badge_message}" \
+          color="${badge_color}" \
+          to_json schemaVersion label message color \
+          > output/${{ env.BADGE_FILENAME_PREFIX }}-${{ steps.meta.outputs.TEST_CASE_NAME }}.json
+
       - name: Upload training logs as artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.JOB_NAME }}
           path: output/*
@@ -457,15 +645,19 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-22.04
-
+    env:
+      BADGE_FILENAME_PREFIX: badge-rosetta-pax-single-node-dropout-te
     steps:
       - name: Print environment variables
         run: env
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.8.0
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Check out the repository under ${GITHUB_WORKSPACE}
+        uses: actions/checkout@v4
 
       - name: Setup SSH known hosts
         id: ssh-known-hosts
@@ -481,6 +673,7 @@ jobs:
         id: meta
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           IMAGE="$(echo ${{inputs.PAX_IMAGE}} | sed 's/\//#/')"
           TEST_CASE_NAME=${{ matrix.PARALLEL_CONFIG[1] }}DP_TE_dropout
           TOTAL_TASKS=$((${{ matrix.PARALLEL_CONFIG[0] }} * ${{ matrix.PARALLEL_CONFIG[1] }} * ${{ matrix.PARALLEL_CONFIG[2] }} * ${{ matrix.PARALLEL_CONFIG[3] }}))
@@ -488,7 +681,7 @@ jobs:
           NODES=$(((TOTAL_TASKS+MAX_GPUS_PER_NODE-1)/MAX_GPUS_PER_NODE))
           GPUS_PER_NODE=$((TOTAL_TASKS/NODES))
 
-          JOB_NAME=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
+          JOB_NAME=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
           LOG_FILE=/nfs/cluster/${JOB_NAME}.log
           MODEL_PATH=/nfs/cluster/${JOB_NAME}
           for var in IMAGE TEST_CASE_NAME TOTAL_TASKS NODES GPUS_PER_NODE JOB_NAME LOG_FILE MODEL_PATH; do
@@ -508,13 +701,22 @@ jobs:
           #SBATCH --exclusive
           #SBATCH --nodes=${{ steps.meta.outputs.NODES }}
           #SBATCH --gpus-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
-          #SBATCH --tasks=${{ steps.meta.outputs.TOTAL_TASKS }}
-          #SBATCH --tasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
           #SBATCH --time=00:30:00
           #SBATCH --output=${{ steps.meta.outputs.LOG_FILE }}
           #SBATCH --export="VOCAB_PATH=gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model,ENROOT_PASSWORD=${{ secrets.GITHUB_TOKEN }}"
+
+          # preload enroot container using one task per node
           time srun \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-image=${{ steps.meta.outputs.IMAGE }} \
+            true
+
+          # run job with tasks on each node sharing one container
+          time srun \
+            --ntasks=${{ steps.meta.outputs.TOTAL_TASKS }} \
+            --ntasks-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }} \
+            --container-name=runtime \
             --container-mounts=${{ steps.meta.outputs.MODEL_PATH }}:/output \
             --container-entrypoint \
             test-pax.sh \
@@ -530,20 +732,15 @@ jobs:
               --enable-dropout \
               --enable-te \
               --additional-args --fdl.PACKED_INPUT=False \
-              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess) \
-              ${{ inputs.EXTRA_TEST_ARGS }}
+              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess)
           EOF
           )
 
           echo "SLURM_JOB_ID=${JOB}" >> $GITHUB_OUTPUT
 
-          set +x
-          while sshx squeue -j $JOB | grep -q $JOB; do
-            echo "SLURM Job $JOB is still running."
-            sleep 15
-          done
+          . .github/workflows/scripts/wait_for_slurm_job.sh
 
-          echo "SLURM Job $JOB finished."
+          wait_for_slurm_job ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }} ${JOB}
 
           # Gather job info
           SLURM_STATE=$(sshx sacct -j $JOB --format=State --parsable2 --noheader |& head -n 1)
@@ -565,6 +762,7 @@ jobs:
       - name: Retrieve training logs and upload to TensorBoard server
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           mkdir output/
           rsync -rtz --progress \
             ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}:${{ steps.meta.outputs.LOG_FILE }} \
@@ -574,7 +772,7 @@ jobs:
             output/ || true
           rsync -rtz --progress \
             output/ \
-            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}/ || true
+            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}/ || true
 
       - name: Write SLURM job status to file
         shell: bash -x -e {0}
@@ -586,8 +784,49 @@ jobs:
               json.dump(dump, f)
           EOF
 
+      - name: Generate sitrep
+        if: success() || failure()
+        shell: bash -x -e {0}
+        run: |
+          # bring in utility functions
+          cd $GITHUB_WORKSPACE
+          source .github/workflows/scripts/to_json.sh
+
+          EXIT_STATUSES="output/*-status.json"
+          badge_label='ROSETTA PAX SINGLE NODE DROPOUT TE ${{ steps.meta.outputs.TEST_CASE_NAME }}'
+          passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
+          failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
+          total_tests=$(ls $EXIT_STATUSES | wc -l)
+          
+          if [[ ${failed_tests} > 0 ]] || [[ ${total_tests} == 0 ]]; then
+            badge_message='error'
+            badge_color=red
+            summary="ROSETTA PAX SINGLE NODE DROPOUT TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          else
+            badge_message="${passed_tests}/${total_tests} passed"
+            if [[ ${failed_tests} == 0 ]]; then
+              badge_color=brightgreen
+            else
+              badge_color=yellow
+            fi
+            summary="ROSETTA PAX SINGLE NODE DROPOUT TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          fi
+      
+          to_json \
+            summary \
+            total_tests passed_tests failed_tests \
+            badge_label badge_color badge_message \
+          > output/sitrep.json
+
+          schemaVersion=1 \
+          label="${badge_label}" \
+          message="${badge_message}" \
+          color="${badge_color}" \
+          to_json schemaVersion label message color \
+          > output/${{ env.BADGE_FILENAME_PREFIX }}-${{ steps.meta.outputs.TEST_CASE_NAME }}.json
+
       - name: Upload training logs as artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.JOB_NAME }}
           path: output/*
@@ -600,15 +839,19 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-22.04
-
+    env:
+      BADGE_FILENAME_PREFIX: badge-rosetta-pax-single-process-evaluation-te
     steps:
       - name: Print environment variables
         run: env
 
       - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.8.0
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Check out the repository under ${GITHUB_WORKSPACE}
+        uses: actions/checkout@v4
 
       - name: Setup SSH known hosts
         id: ssh-known-hosts
@@ -626,12 +869,10 @@ jobs:
         run: |
           IMAGE="$(echo ${{inputs.PAX_IMAGE}} | sed 's/\//#/')"
           TEST_CASE_NAME=${{ matrix.PARALLEL_CONFIG[1] }}DP${{ matrix.PARALLEL_CONFIG[2] }}FSDP${{ matrix.PARALLEL_CONFIG[3] }}TP${{ matrix.PARALLEL_CONFIG[0] }}PP_eval_TE
-          TOTAL_TASKS=1
           MAX_GPUS_PER_NODE=8
-          NODES=1
           GPUS_PER_NODE=8
 
-          JOB_NAME=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
+          JOB_NAME=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-${TEST_CASE_NAME}
           LOG_FILE=/nfs/cluster/${JOB_NAME}.log
           MODEL_PATH=/nfs/cluster/${JOB_NAME}
           for var in IMAGE TEST_CASE_NAME TOTAL_TASKS NODES GPUS_PER_NODE JOB_NAME LOG_FILE MODEL_PATH; do
@@ -642,21 +883,32 @@ jobs:
         id: submit
         shell: bash -O expand_aliases -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           alias sshx='ssh -o "ServerAliveInterval 7" ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}'
-          sshx "date && hostname && sinfo" 
+          sshx "date && hostname && sinfo"
           sshx mkdir -p ${{ steps.meta.outputs.MODEL_PATH }}
           JOB=$(sshx sbatch --parsable << EOF
           #!/bin/bash
           #SBATCH --job-name=${{ steps.meta.outputs.JOB_NAME }}
           #SBATCH --exclusive
-          #SBATCH --nodes=${{ steps.meta.outputs.NODES }}
+          #SBATCH --nodes=1
           #SBATCH --gpus-per-node=${{ steps.meta.outputs.GPUS_PER_NODE }}
-          #SBATCH --tasks-per-node=1
           #SBATCH --time=00:30:00
           #SBATCH --output=${{ steps.meta.outputs.LOG_FILE }}
           #SBATCH --export="VOCAB_PATH=gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model,ENROOT_PASSWORD=${{ secrets.GITHUB_TOKEN }}"
+
+          # preload enroot container using one task per node
           time srun \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-image=${{ steps.meta.outputs.IMAGE }} \
+            true
+
+          # run job with tasks on each node sharing one container
+          time srun \
+            --ntasks=1 \
+            --ntasks-per-node=1 \
+            --container-name=runtime \
             --container-mounts=${{ steps.meta.outputs.MODEL_PATH }}:/output \
             --container-entrypoint \
             test-pax.sh \
@@ -669,22 +921,16 @@ jobs:
               --data-parallel ${{ matrix.PARALLEL_CONFIG[1] }} \
               --fsdp ${{ matrix.PARALLEL_CONFIG[2] }} \
               --tensor-parallel ${{ matrix.PARALLEL_CONFIG[3] }} \
-              --nodes ${{ steps.meta.outputs.NODES }} \
-              --enable-te \
-              $([[ ${{ steps.meta.outputs.TOTAL_TASKS }} > 1 ]] && echo --multiprocess) \
-              ${{ inputs.EXTRA_TEST_ARGS }}
+              --nodes 1 \
+              --enable-te
           EOF
           )
 
           echo "SLURM_JOB_ID=${JOB}" >> $GITHUB_OUTPUT
 
-          set +x
-          while sshx squeue -j $JOB | grep -q $JOB; do
-            echo "SLURM Job $JOB is still running."
-            sleep 15
-          done
+          . .github/workflows/scripts/wait_for_slurm_job.sh
 
-          echo "SLURM Job $JOB finished."
+          wait_for_slurm_job ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }} ${JOB}
 
           # Gather job info
           SLURM_STATE=$(sshx sacct -j $JOB --format=State --parsable2 --noheader |& head -n 1)
@@ -706,6 +952,7 @@ jobs:
       - name: Retrieve training logs and upload to TensorBoard server
         shell: bash -x -e {0}
         run: |
+          cd $GITHUB_WORKSPACE
           mkdir output/
           rsync -rtz --progress \
             ${{ secrets.CLUSTER_LOGIN_USER }}@${{ vars.HOSTNAME_SLURM_LOGIN }}:${{ steps.meta.outputs.LOG_FILE }} \
@@ -715,7 +962,7 @@ jobs:
             output/ || true
           rsync -rtz --progress \
             output/ \
-            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}/ || true
+            ${{ secrets.TENSORBOARD_UPLOAD_USER }}@${{ vars.HOSTNAME_TENSORBOARD }}:/tensorboard-logs/${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}/ || true
 
       - name: Write SLURM job status to file
         shell: bash -x -e {0}
@@ -726,9 +973,50 @@ jobs:
               dump = {'state': "${{ steps.submit.outputs.SLURM_STATE }}", 'exitcode': "${{ steps.submit.outputs.SLURM_EXITCODE }}"}
               json.dump(dump, f)
           EOF
+
+      - name: Generate sitrep
+        if: success() || failure()
+        shell: bash -x -e {0}
+        run: |
+          # bring in utility functions
+          cd $GITHUB_WORKSPACE
+          source .github/workflows/scripts/to_json.sh
+
+          EXIT_STATUSES="output/*-status.json"
+          badge_label='ROSETTA PAX SINGLE PROCESS EVALUATION TE ${{ steps.meta.outputs.TEST_CASE_NAME }}'
+          passed_tests=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
+          failed_tests=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
+          total_tests=$(ls $EXIT_STATUSES | wc -l)
+          
+          if [[ ${failed_tests} > 0 ]] || [[ ${total_tests} == 0 ]]; then
+            badge_message='error'
+            badge_color=red
+            summary="ROSETTA PAX SINGLE PROCESS EVALUATION TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          else
+            badge_message="${passed_tests}/${total_tests} passed"
+            if [[ ${failed_tests} == 0 ]]; then
+              badge_color=brightgreen
+            else
+              badge_color=yellow
+            fi
+            summary="ROSETTA PAX SINGLE PROCESS EVALUATION TE ${{ steps.meta.outputs.TEST_CASE_NAME }}: $badge_message"
+          fi
+
+          to_json \
+            summary \
+            total_tests passed_tests failed_tests \
+            badge_label badge_color badge_message \
+          > output/sitrep.json
+
+          schemaVersion=1 \
+          label="${badge_label}" \
+          message="${badge_message}" \
+          color="${badge_color}" \
+          to_json schemaVersion label message color \
+          > output/${{ env.BADGE_FILENAME_PREFIX }}-${{ steps.meta.outputs.TEST_CASE_NAME }}.json
         
       - name: Upload training logs as artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.JOB_NAME }}
           path: output/*
@@ -739,92 +1027,42 @@ jobs:
 
     steps:
       - name: Check out the repository under ${GITHUB_WORKSPACE}
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
 
       - name: Run pytest
-        shell: bash -x {0}
+        shell: bash -eux {0}
         run: |
           pip install pytest pytest-reportlog tensorboard
-          for i in ${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-*DP*FSDP*TP*PP* ${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-*DP_TE_dropout; do
-            SUBDIR=$(echo $i | rev | cut -d'-' -f1 | rev)
-            mv $i/$SUBDIR* .
-            python3 .github/workflows/baselines/summarize_metrics.py $SUBDIR # create result json in baseline format
+          for i in ${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}-*; do
+            JOB_NAME=$(echo $i | awk -F "${GITHUB_RUN_ID}-" '{print $2}')
+            METRIC_PATH=${JOB_NAME}_metrics.json
+            python3 .github/workflows/baselines/summarize_metrics.py $i/$JOB_NAME --output_json_path $METRIC_PATH
+            # Test script expects the job dir and the log to be in the CWD
+            mv $i/$JOB_NAME $i/${JOB_NAME}.log .
           done
-
-          echo '## Rosetta PAX MGMN Test Metrics' >> $GITHUB_STEP_SUMMARY
-          for i in *_metrics.json; do
-            echo $(basename -- $i _metrics.json)
-            echo '```json'
-            jq . $i
-            echo '```'
-          done | tee -a $GITHUB_STEP_SUMMARY
 
           RESULTS_DIR=$PWD BASELINES_DIR=PAX_MGMN/rosetta pytest --report-log=report.jsonl .github/workflows/baselines/test_pax_mgmn_metrics.py || true
 
       - name: Upload metrics test json logs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: metrics-test-log
-          path: report.jsonl
+          name: ${{ inputs.FW_NAME }}-metrics-test-log
+          path: |
+            report.jsonl
+            *_metrics.json
 
-
-  publish-test:
-    needs: [single-process-multi-device-te, rosetta-pax-multi-node, rosetta-pax-multi-node-te, rosetta-pax-single-node-dropout-te, single-process-evaluation-te, metrics]
-    uses: ./.github/workflows/_publish_badge.yaml
+  sitrep:
+    needs: metrics
     if: "!cancelled()"
+    uses: ./.github/workflows/_sitrep_mgmn.yaml
     secrets: inherit
     with:
-      ENDPOINT_FILENAME: '${{ inputs.ARTIFACT_NAME }}rosetta-pax-test-status.json'
-      PUBLISH: false
-      SCRIPT: |
-        EXIT_STATUSES="${{ inputs.ARTIFACT_NAME }}rosetta-pax-*DP*FSDP*TP*PP*/*-status.json ${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}-*DP_TE_dropout/*-status.json"
-        PASSED_TESTS=$(jq -r '. | select ((.state == "COMPLETED") and (.exitcode == "0")) | .state' $EXIT_STATUSES | wc -l)
-        FAILED_TESTS=$(jq -r '. | select ((.state != "COMPLETED") or (.exitcode != "0")) | .state' $EXIT_STATUSES | wc -l)
-        TOTAL_TESTS=$(ls $EXIT_STATUSES | wc -l)
-
-        cat <<EOF >>$GITHUB_STEP_SUMMARY
-        ## Pax MGMN+SPMD Test Status
-        | Test Case | State | Exit Code |
-        | --- | --- | --- |
-        EOF
-        for i in $EXIT_STATUSES; do
-          # Files are named rosetta-pax-<GHID>-<NAME>/<NAME>-status.json
-          echo "| $(echo $i | cut -d/ -f1 | cut -d- -f4) | $(jq -r .state $i) | $(jq -r .exitcode $i)"
-        done | tee -a $GITHUB_STEP_SUMMARY
-
-        echo "Test statuses:"
-        jq -rc 'input_filename,.' $EXIT_STATUSES
-
-        METRICS_LOG=metrics-test-log/report.jsonl
-        all_outcomes() {
-          cat $METRICS_LOG | jq -r '. | select((.["$report_type"] == "TestReport") and (.when == "call")) | .outcome'
-        }
-        cnt_type() {
-          cat $METRICS_LOG | jq '. | select((.["$report_type"] == "TestReport") and (.when == "call") and (.outcome | contains("'${1}'"))) | .outcome' | wc -l
-        }
-        PYTEST_FAILED_TESTS=$(cnt_type failed)
-        PYTEST_PASSED_TESTS=$(cnt_type passed)
-        PYTEST_TOTAL_TESTS=$(all_outcomes | wc -l)
-
-        if ([[ $FAILED_TESTS -eq 0 ]] && [[ $TOTAL_TESTS -gt 0 ]] && \
-            [[ $PYTEST_FAILED_TESTS -eq 0 ]] && [[ $PYTEST_TOTAL_TESTS -gt 0 ]]); then
-          STATUS=success
-          BADGE_COLOR=brightgreen
-        elif [[ $PASSED_TESTS -eq 0 ]] || [[ $PYTEST_PASSED_TESTS -eq 0 ]]; then
-          STATUS=failure
-          BADGE_COLOR=red
-        else
-          STATUS=failure
-          BADGE_COLOR=yellow
-        fi
-        echo "STATUS='${STATUS}'" >> ${GITHUB_OUTPUT}
-        echo "LABEL='Completion'" >> $GITHUB_OUTPUT
-        echo "MESSAGE='${PASSED_TESTS}/${TOTAL_TESTS} ran ${PYTEST_PASSED_TESTS}/${PYTEST_TOTAL_TESTS} pass loss+perf'" >> $GITHUB_OUTPUT
-        echo "COLOR='${BADGE_COLOR}'" >> $GITHUB_OUTPUT
-
+      BADGE_FILENAME: ${{ inputs.BADGE_FILENAME }}
+      ARTIFACT_NAME: ${{ inputs.ARTIFACT_NAME }}
+      FW_NAME: ${{ inputs.FW_NAME }}
 
   summary:
     runs-on: ubuntu-22.04
@@ -838,18 +1076,18 @@ jobs:
 
           ## Rosetta PAX MGMN training
 
-          [view metrics](https://${{ vars.HOSTNAME_TENSORBOARD }}/#scalars&regexInput=${{ inputs.ARTIFACT_NAME }}rosetta-pax-${GITHUB_RUN_ID}&_smoothingWeight=0&tagFilter=seqs_per)
+          [view metrics](https://${{ vars.HOSTNAME_TENSORBOARD }}/#scalars&regexInput=${{ inputs.FW_NAME }}-${GITHUB_RUN_ID}&_smoothingWeight=0&tagFilter=seqs_per)
 
           EOF
           ) | tee $GITHUB_STEP_SUMMARY
 
   outcome:
-    needs: publish-test
+    needs: sitrep
     runs-on: ubuntu-22.04
     if: "!cancelled()"
     steps:
       - name: Sets workflow status based on test outputs 
         run: |
-          if [[ ${{ needs.publish-test.outputs.STATUS }} != success ]]; then
+          if [[ ${{ needs.sitrep.outputs.STATUS }} != success ]]; then
             exit 1
           fi

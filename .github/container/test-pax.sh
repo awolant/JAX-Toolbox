@@ -17,6 +17,8 @@ usage() {
     echo "  --dtype                    Batch size, defaults to bfloat16."
     echo "  --enable-te                If set, will run with env var ENABLE_TE=1." 
     echo "  --enable-dropout           If set, will set DROPOUT_PROB to 0.1."
+    echo "  --enable-fused-attn        Whether to test fused attention through TE."
+    echo "  --run-5b                   Whether run GPT5B rather than the default 126M."
     echo "  --evaluate                 Whether to test evaluation rather than training."
     echo "  -s, --steps                Number of steps to run, defaults to 500."
     echo "  --multiprocess             Enable the multiprocess GPU mode."
@@ -30,7 +32,7 @@ usage() {
     exit $1
 }
 
-args=$(getopt -o a:b:s:o:n:h --long additional-args:,batch-per-gpu:,dtype:,enable-te,enable-dropout,evaluate,steps:,help,multiprocess,output:,data-parallel:,fsdp:,tensor-parallel:,pipeline-parallel:,nodes: -- "$@")
+args=$(getopt -o a:b:s:o:n:h --long additional-args:,batch-per-gpu:,dtype:,enable-te,enable-dropout,enable-fused-attn,run-5b,evaluate,steps:,help,multiprocess,output:,data-parallel:,fsdp:,tensor-parallel:,pipeline-parallel:,nodes: -- "$@")
 if [[ $? -ne 0 ]]; then
     exit $1
 fi
@@ -48,8 +50,10 @@ TP=1
 PP=1
 NODES=1
 ENABLE_TE=0
+NVTE_FUSED_ATTN=0
 DROPOUT=0
 EVALUATE=0
+RUN_5B=0
 ADDITIONAL_ARGS=""
 
 eval set -- "$args"
@@ -73,6 +77,14 @@ while [ : ]; do
             ;;
         --enable-dropout)
             DROPOUT='0.1'
+            shift 1
+            ;;
+        --enable-fused-attn)
+            NVTE_FUSED_ATTN=1
+            shift 1
+            ;;
+        --run-5b)
+            RUN_5B=1
             shift 1
             ;;
         --evaluate)
@@ -136,6 +148,7 @@ print_var NGPUS
 print_var OUTPUT
 print_var MULTIPROCESS
 print_var ENABLE_TE
+print_var NVTE_FUSED_ATTN
 print_var EVALUATE
 print_var DROPOUT
 print_var DP
@@ -150,7 +163,7 @@ pushd ${PAXML_DIR}
 cat > ci_configs.py <<EOF
 import math
 from paxml import tasks_lib, experiment_registry
-from paxml.contrib.gpu.scripts_gpu.configs import GPT126M, configure_gpt3_task
+from paxml.contrib.gpu.scripts_gpu.configs import Synthetic126M, configure_gpt3_task
 from paxml.tasks.lm.params.c4 import TransformerLmSpmdPipelineAdam
 from paxml.tasks.lm.params.lm_cloud import SyntheticDataset
 from praxis import base_layer
@@ -162,7 +175,6 @@ tp = ${TP}
 pp = ${PP}
 num_gpus = ${NGPUS}
 percore_batch_size = ${BATCH_PER_GPU}
-steps = ${STEPS}
 dtype = "${DTYPE}"
 dropout = float(${DROPOUT})
 
@@ -235,6 +247,9 @@ class GPT126MPP(TransformerLmSpmdPipelineAdam):
   ## dropout
   DROPOUT_PROB = dropout
 
+  ## disable eval to avoid including eval
+  ## in steps/sec calculation
+  EVAL_INTERVAL_STEPS = 100000
   
   def task(self):
     task_p = super().task()
@@ -272,7 +287,7 @@ class GPT126MPP(TransformerLmSpmdPipelineAdam):
 
 if pp > 1:
   @experiment_registry.register
-  class Synthetic126M(GPT126MPP, SyntheticDataset):
+  class Synthetic126MCI(GPT126MPP, SyntheticDataset):
     
     ICI_MESH_SHAPE = [pp, dp, fsdp, tp]
     DCN_MESH_SHAPE = [dcn_pp, dcn_dp, dcn_fsdp, 1]
@@ -280,7 +295,6 @@ if pp > 1:
     NUM_STAGES = pp
     PERCORE_BATCH_SIZE = percore_batch_size
     FRPOP_DTYPE = dtype
-    MAX_STEPS = steps
     
     def task(self):
       task_p = super().task()
@@ -290,23 +304,23 @@ if pp > 1:
 
 else:
   @experiment_registry.register
-  class Synthetic126M(GPT126M, SyntheticDataset):
+  class Synthetic126MCI(Synthetic126M):
     
     ICI_MESH_SHAPE = [dp, fsdp, tp]
     DCN_MESH_SHAPE = [dcn_dp, dcn_fsdp, 1]
     PERCORE_BATCH_SIZE = percore_batch_size
     FRPOP_DTYPE = dtype
-    MAX_STEPS = steps
 
     DROPOUT_PROB = dropout
+
+    ## disable eval
+    EVAL_INTERVAL_STEPS = 100000
     
     def task(self):
       task_p = super().task()
 
       model_p = task_p.model
       stacked_p = model_p.lm_tpl.stacked_transformer_tpl
-      if stacked_p.cls == layers.PipelinedTransformer:
-        stacked_p = stacked_p.pipeline_stage
       if issubclass(stacked_p.cls, layers.StackedTransformerRepeated):
         stacked_p = stacked_p.block
 
@@ -329,10 +343,18 @@ set -ex
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.65}
 export ENABLE_TE=$ENABLE_TE
+export NVTE_FUSED_ATTN=$NVTE_FUSED_ATTN
+
+CONFIG=ci_configs.Synthetic126MCI
+if [[ ${RUN_5B} -ne 0 ]]; then
+  CONFIG=paxml.contrib.gpu.scripts_gpu.configs.Synthetic5B
+  ADDITIONAL_ARGS="--fdl.DCN_MESH_SHAPE=[1,${NODES},1] --fdl.ICI_MESH_SHAPE=[${DP},${FSDP},${TP}] ${ADDITIONAL_ARGS} --fdl.PERCORE_BATCH_SIZE=${BATCH_PER_GPU}"
+fi
+
 if [[ ${EVALUATE} -ne 0 ]]; then
   ## train for 0 steps to generate an initial checkpoint
   python -m paxml.main \
-    --fdl_config=ci_configs.Synthetic126M \
+    --fdl_config=${CONFIG} \
     --fdl.MAX_STEPS=0 \
     --job_log_dir=${OUTPUT} \
     --alsologtostderr \
@@ -341,9 +363,10 @@ if [[ ${EVALUATE} -ne 0 ]]; then
 
   ## restore from initial checkpoint for eval
   python -m paxml.main \
-    --fdl_config=ci_configs.Synthetic126M \
+    --fdl_config=${CONFIG} \
     --job_log_dir=${OUTPUT} \
     --mode='eval' \
+    --fdl.MAX_STEPS=0 \
     --alsologtostderr \
     --enable_checkpoint_saving=False \
     $ADDITIONAL_ARGS \
@@ -352,9 +375,10 @@ if [[ ${EVALUATE} -ne 0 ]]; then
   rm -rf ${OUTPUT}/checkpoints
 else
   python -m paxml.main \
-    --fdl_config=ci_configs.Synthetic126M \
+    --fdl_config=${CONFIG} \
     --job_log_dir=${OUTPUT} \
     --alsologtostderr \
+    --fdl.MAX_STEPS=${STEPS} \
     --enable_checkpoint_saving=False \
     $ADDITIONAL_ARGS \
     $([[ $MULTIPROCESS != 0 ]] && echo --multiprocess_gpu)

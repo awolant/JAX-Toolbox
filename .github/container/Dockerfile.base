@@ -4,43 +4,50 @@ ARG GIT_USER_NAME="JAX Toolbox"
 ARG GIT_USER_EMAIL=jax@nvidia.com
 ARG SRC_MANIFEST_FILE=manifest.yaml
 ARG DEST_MANIFEST_DIR=/opt/manifest.d
-
+ARG CLANG_VERSION=17
 
 FROM ${BASE_IMAGE}
 ARG GIT_USER_EMAIL
 ARG GIT_USER_NAME
 ARG SRC_MANIFEST_FILE
 ARG DEST_MANIFEST_DIR
-
+ARG CLANG_VERSION
 
 ###############################################################################
 ## Install Python and essential tools
 ###############################################################################
 
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive \
-    TZ=America/Los_Angeles \
-    apt-get install -y \
-        build-essential \
-        checkinstall \
-        clang \
-        cmake \
-        curl \
-        git \
-        lld \
-        vim \
-        bat \
-        curl \
-        git \
-        gnupg \
-        rsync \
-        python-is-python3 \
-        python3-pip \
-        liblzma-dev \
-        wget \
-    && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN <<"EOF" bash -ex
+export DEBIAN_FRONTEND=noninteractive
+export TZ=America/Los_Angeles
+apt-get update
+
+apt-get install -y \
+  bat \
+  build-essential \
+  checkinstall \
+  cmake \
+  curl \
+  git \
+  gnupg \
+  liblzma-dev \
+  lld \
+  python-is-python3 \
+  python3-pip \
+  rsync \
+  vim \
+  wget \
+  lsb-release software-properties-common  # for llvm.sh
+
+# Install LLVM/Clang
+bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" -- ${CLANG_VERSION}
+apt-get remove -y software-properties-common lsb-release
+apt-get autoremove -y  # removes python3-blinker which conflicts with pip-compile in JAX
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOF
+
 RUN <<"EOF" bash -ex
 git config --global user.name "${GIT_USER_NAME}"
 git config --global user.email "${GIT_USER_EMAIL}"
@@ -63,6 +70,12 @@ git add -u
 git commit -m 'Adds JAX_TOOLBOX_VCS_EQUIVALENCY as a trigger to treat all github VCS installs for a package as equivalent. The spec of the last encountered version will be used'
 EOF
 RUN pip install --upgrade --no-cache-dir -e /opt/pip pip-tools && rm -rf ~/.cache/*
+
+###############################################################################
+## Install the latest versions of Nsight Systems and Nsight Compute
+###############################################################################
+ADD install-nsight.sh /usr/local/bin
+RUN install-nsight.sh
 
 ###############################################################################
 ## Install cuDNN
@@ -92,12 +105,6 @@ RUN install-ofed.sh
 ADD install-efa.sh /usr/local/bin
 ENV LD_LIBRARY_PATH=/opt/amazon/efa/lib:${LD_LIBRARY_PATH}
 ENV PATH=/opt/amazon/efa/bin:${PATH}
-
-###############################################################################
-## Emergency fix: nsys not in PATH
-###############################################################################
-
-RUN ln -s /opt/nvidia/nsight-compute/*/host/target-linux-x64/nsys /usr/local/cuda/bin
 
 ###############################################################################
 ## Add the systemcheck to the entrypoint.
